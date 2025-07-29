@@ -29,5 +29,7 @@ pub struct EncryptResult {
 #[derive(Debug)]
 pub struct RecipientEncryptedKey {
     pub pubkey: Vec<u8>,
+    pub ephemeral_pubkey: Vec<u8>,
     pub encrypted_key: Vec<u8>,
+    pub nonce: Vec<u8>,
 }

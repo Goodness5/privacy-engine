@@ -3,9 +3,12 @@ use aes_gcm::{
 };
 use rand::RngCore;
 use serde::{Serialize, Deserialize};
-use crate::types::{EncryptResult, RecipientEncryptedKey, RecipientInfo};
+use crate::{traits::crypto::CryptoProtocol, types::{EncryptResult, RecipientEncryptedKey, RecipientInfo}};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 // use rand_core::RngCore;
+pub struct MessageEncryptor {
+    protocol: Box<dyn CryptoProtocol>,
+}
 
 
 fn generate_aes_key() -> Key<Aes256Gcm> {
@@ -18,33 +21,28 @@ fn generate_aes_key() -> Key<Aes256Gcm> {
 /// # Arguments
 /// * `cipher_text` - The plaintext message to encrypt.
 /// * `pub_keys` - Optional vector of public keys, each as a Vec<u8> (any length, e.g., 32 bytes for Curve25519, or longer for other schemes).
-pub fn encrypt_message(cipher_text: String, pub_keys: Option<Vec<Vec<u8>>>) {
-    let key = generate_aes_key();
-    let cipher = Aes256Gcm::new(&key);
-    let nonce = Aes256Gcm::generate_nonce(OsRng);
-    match cipher.encrypt(&nonce, cipher_text.as_bytes()) {
-        Ok(encrypted_message) => {
-            // Success! Do whatever with encrypted_message
-            println!("Encrypted message length: {}", encrypted_message.len());
-            // ... continue processing ...
-        },
-        Err(e) => {
-            eprintln!("Encryption failed: {:?}. Retrying with formatted string...", e);
-            // Try to format the string: trim, normalize newlines, etc.
-            let formatted = cipher_text.trim().replace("\r\n", "\n").replace("\r", "\n");
-            match cipher.encrypt(&nonce, formatted.as_bytes()) {
-                Ok(encrypted_message) => {
-                    println!("Encrypted message length (after formatting): {}", encrypted_message.len());
-                    // ... continue processing ...
-                },
-                Err(e2) => {
-                    eprintln!("Encryption failed again: {:?}", e2);
-                }
-            }
-        }
-    }
-}
+    pub fn encrypt_message(&self, message: &str, recipients: Vec<RecipientInfo>) -> Result<EncryptResult, CryptoError> {
+        let key = self.generate_symmetric_key();
+        let (ciphertext, nonce) = self.encrypt_message_with_key(message, &key)?;
+        let mut recipient_keys = Vec::new();
 
+        for recipient in recipients {
+            let protocol = self.protocols.get(&recipient.protocol)
+                .ok_or_else(|| CryptoError::EncryptionError(format!("Unsupported protocol: {:?}", recipient.protocol)))?;
+            let encrypted_key = protocol.encrypt_key(key.as_ref(), &recipient.pubkey)?;
+            recipient_keys.push(RecipientEncryptedKey {
+                pubkey: recipient.pubkey,
+                encrypted_key,
+                protocol: recipient.protocol,
+            });
+        }
+
+        Ok(EncryptResult {
+            ciphertext,
+            nonce,
+            recipient_keys,
+        })
+    }
 
 
 pub fn encrypt_shared_secret_for_recipients(

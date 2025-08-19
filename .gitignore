@@ -11,7 +11,8 @@ Cargo.lock
 *.swp
 *.swo
 *.bak
-
+*.env
+.env
 # OS files
 .DS_Store
 Thumbs.db

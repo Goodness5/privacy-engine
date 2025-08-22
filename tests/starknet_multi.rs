@@ -118,4 +118,3 @@ fn encrypt_agreement_for_two_and_decrypt_each() {
     assert_eq!(plaintext2, agreement);
 }
 
-

@@ -1,19 +1,17 @@
-use starknet_core::crypto::{ExtendedSignature};
-use starknet_types_core::felt::Felt;
 use crate::types::{CryptoError, EncryptedData};
 
 pub trait CryptoProtocol {
     fn encrypt_key(
         &self,
-        pubkey: &[u8],
+        recipient_identifier: &[u8],
         msg_hash: Option<&[u8]>,
-        key: &str,
-    ) -> Result<crate::types::WrappedKey, CryptoError>;
+        key: &[u8],
+    ) -> Result<EncryptedData, CryptoError>;
     fn decrypt_key(
         &self,
         encrypted_data: &EncryptedData,
         privkey: &[u8],
-    ) -> Result<String, CryptoError>;
+    ) -> Result<Vec<u8>, CryptoError>;
     fn sign_message(&self, privkey: &[u8], message_hash: &[u8]) -> Result<Vec<u8>, CryptoError>;
     fn verify_signature(
         &self,

@@ -2,7 +2,7 @@ use starknet_core::crypto::{ ecdsa_sign, ecdsa_verify, Signature };
 use starknet_crypto::{recover, ExtendedSignature, FieldElement as CryptoFieldElement};
 use starknet_types_core::felt::Felt;
 use crate::traits::crypto::CryptoProtocol;
-use crate::types::{ CryptoError, EncryptedData, WrappedKey };
+use crate::types::{ CryptoError, EncryptedData };
 
 pub struct StarknetProtocol;
 use aes_gcm::{ aead::{ Aead, KeyInit, OsRng, rand_core::RngCore }, Aes256Gcm, Key, Nonce };
@@ -161,10 +161,10 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
     
     fn encrypt_key(
         &self,
-        sig_or_pubkey: &[u8],
+        recipient_identifier: &[u8],
         msg_hash: Option<&[u8]>,
-        decryption_key: &str
-    ) -> Result<crate::types::WrappedKey, CryptoError> {
+        key: &[u8]
+    ) -> Result<EncryptedData, CryptoError> {
 
         let mut signature = ExtendedSignature {
             r: CryptoFieldElement::ZERO,
@@ -173,18 +173,18 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         };
         let pubkey = if let Some(hash) = msg_hash {
             // We were given a signature and message hash
-            if sig_or_pubkey.len() != 96 {
+            if recipient_identifier.len() != 96 {
                 // r(32) + s(32) + v(32)
                 return Err(CryptoError::SignError);
             }
 
-            let r_bytes: [u8; 32] = sig_or_pubkey[..32]
+            let r_bytes: [u8; 32] = recipient_identifier[..32]
                 .try_into()
                 .map_err(|_| CryptoError::SignError)?;
-            let s_bytes: [u8; 32] = sig_or_pubkey[32..64]
+            let s_bytes: [u8; 32] = recipient_identifier[32..64]
                 .try_into()
                 .map_err(|_| CryptoError::SignError)?;
-            let v_bytes: [u8; 32] = sig_or_pubkey[64..]
+            let v_bytes: [u8; 32] = recipient_identifier[64..]
                 .try_into()
                 .map_err(|_| CryptoError::SignError)?;
 
@@ -200,7 +200,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
             Self::recover_pubkey(&msg_hash_felt, &signature)?
         } else {
             // We were given a public key directly
-            let pubkey_bytes: [u8; 32] = sig_or_pubkey
+            let pubkey_bytes: [u8; 32] = recipient_identifier
                 .try_into()
                 .map_err(|_| CryptoError::SignError)?;
             Felt::from_bytes_be(&pubkey_bytes)
@@ -242,7 +242,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         let encoded_shared = shared_affine.to_encoded_point(false);
         let shared_x = encoded_shared.x().ok_or(CryptoError::PointError)?;
         let mut h = Sha256::new();
-        h.update(shared_x);
+        h.update(shared_x.as_slice());
         let aes_key_bytes = h.finalize();
         let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
 
@@ -252,7 +252,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         rng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, decryption_key.as_bytes())
+            .encrypt(nonce, key)
             .map_err(|_| CryptoError::SymmetricError)?;
 
         // Serialize ephemeral public key (uncompressed: x || y)
@@ -260,10 +260,10 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         let eph_x = encoded_eph.x().ok_or(CryptoError::PointError)?;
         let eph_y = encoded_eph.y().ok_or(CryptoError::PointError)?;
         let mut eph_bytes = Vec::with_capacity(64);
-        eph_bytes.extend_from_slice(eph_x);
-        eph_bytes.extend_from_slice(eph_y);
+        eph_bytes.extend_from_slice(eph_x.as_slice());
+        eph_bytes.extend_from_slice(eph_y.as_slice());
 
-        Ok(WrappedKey {
+        Ok(EncryptedData {
             ciphertext,
             nonce: nonce_bytes.to_vec(),
             ephemeral_pubkey: eph_bytes,
@@ -271,7 +271,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
     }
 
     /// Decrypt the wrapped key using the private key
-     fn decrypt_key(&self, wrapped: &EncryptedData, privkey: &[u8],) -> Result<String, CryptoError> {
+     fn decrypt_key(&self, wrapped: &EncryptedData, privkey: &[u8],) -> Result<Vec<u8>, CryptoError> {
         if wrapped.ephemeral_pubkey.len() != 64 {
             return Err(CryptoError::PointError);
         }
@@ -300,7 +300,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         let encoded_shared = shared_affine.to_encoded_point(false);
         let shared_x = encoded_shared.x().ok_or(CryptoError::PointError)?;
         let mut h = Sha256::new();
-        h.update(shared_x);
+        h.update(shared_x.as_slice());
         let aes_key_bytes = h.finalize();
         let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
 
@@ -311,7 +311,7 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
             .decrypt(nonce, wrapped.ciphertext.as_ref())
             .map_err(|_| CryptoError::SymmetricError)?;
 
-        String::from_utf8(plaintext).map_err(|_| CryptoError::DecodeError)
+        Ok(plaintext)
     }
 }
 
@@ -365,7 +365,7 @@ fn test_sign_with_recovery() {
     // Test key encryption/decryption
     let secret_key = env::var("TEST_SECRET_KEY").unwrap_or_else(|_| "my_secret_key".to_string());
 
-    let wrapped_key = protocol.encrypt_key(&sig, Some(&msg_hash_bytes), &secret_key).unwrap();
+    let wrapped_key = protocol.encrypt_key(&sig, Some(&msg_hash_bytes), secret_key.as_bytes()).unwrap();
     println!("Wrapped Key: {:?}", wrapped_key);
 
     let encrypted_data = EncryptedData {
@@ -376,7 +376,7 @@ fn test_sign_with_recovery() {
 
     let decrypted_key = protocol.decrypt_key(&encrypted_data, &privkey_bytes).unwrap();
     println!("Decrypted Key: {:?}", decrypted_key);
-    assert_eq!(decrypted_key, secret_key);
+    assert_eq!(decrypted_key, secret_key.as_bytes());
 }
 
 }

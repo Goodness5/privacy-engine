@@ -1,104 +1,97 @@
 use aes_gcm::{
-    aead::{rand_core, Aead, AeadCore, KeyInit, OsRng}, Aes256Gcm, Key, Nonce
+    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    Aes256Gcm, Key, Nonce,
 };
-use rand::RngCore;
-use serde::{Serialize, Deserialize};
-use crate::{traits::crypto::CryptoProtocol, types::{EncryptResult, RecipientEncryptedKey, RecipientInfo}};
-use x25519_dalek::{EphemeralSecret, PublicKey};
-// use rand_core::RngCore;
-pub struct MessageEncryptor {
-    protocol: Box<dyn CryptoProtocol>,
-}
-
+use crate::types::{EncryptResult, RecipientEncryptedKey, RecipientInfo, Protocol, CryptoError, EncryptedData};
+use crate::traits::crypto::CryptoProtocol;
+use crate::chains::x25519::X25519Protocol;
+use crate::chains::starknet::StarknetProtocol;
 
 fn generate_aes_key() -> Key<Aes256Gcm> {
     Aes256Gcm::generate_key(&mut OsRng)
 }
 
-
-/// Encrypt a message for multiple recipients.
-///
-/// # Arguments
-/// * `cipher_text` - The plaintext message to encrypt.
-/// * `pub_keys` - Optional vector of public keys, each as a Vec<u8> (any length, e.g., 32 bytes for Curve25519, or longer for other schemes).
-    pub fn encrypt_message(&self, message: &str, recipients: Vec<RecipientInfo>) -> Result<EncryptResult, CryptoError> {
-        let key = self.generate_symmetric_key();
-        let (ciphertext, nonce) = self.encrypt_message_with_key(message, &key)?;
-        let mut recipient_keys = Vec::new();
-
-        for recipient in recipients {
-            let protocol = self.protocols.get(&recipient.protocol)
-                .ok_or_else(|| CryptoError::EncryptionError(format!("Unsupported protocol: {:?}", recipient.protocol)))?;
-            let encrypted_key = protocol.encrypt_key(key.as_ref(), &recipient.pubkey)?;
-            recipient_keys.push(RecipientEncryptedKey {
-                pubkey: recipient.pubkey,
-                encrypted_key,
-                protocol: recipient.protocol,
-            });
-        }
-
-        Ok(EncryptResult {
-            ciphertext,
-            nonce,
-            recipient_keys,
-        })
+fn get_protocol_impl(protocol: Protocol) -> Box<dyn CryptoProtocol> {
+    match protocol {
+        Protocol::X25519 => Box::new(X25519Protocol::new()),
+        Protocol::Starknet => Box::new(StarknetProtocol),
     }
+}
 
+pub fn encrypt_message(message: &[u8], recipients: Vec<RecipientInfo>) -> Result<EncryptResult, CryptoError> {
+    let key = generate_aes_key();
+    let cipher = Aes256Gcm::new(&key);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, message)
+        .map_err(|_| CryptoError::SymmetricError)?;
 
-pub fn encrypt_shared_secret_for_recipients(
-    secret: &[u8],
-    recipients_pubkeys: Vec<Vec<u8>>,
-) -> Result<Vec<RecipientEncryptedKey>, Box<dyn std::error::Error>> {
-    let mut encrypted_keys = Vec::with_capacity(recipients_pubkeys.len());
-
-    for pubkey_bytes in recipients_pubkeys {
-        // Parse recipient public key (more efficient clone handling)
-        let recipient_pubkey = PublicKey::from(<[u8; 32]>::try_from(&pubkey_bytes[..])?);
-
-        // Generate ephemeral key pair
-        let ephemeral_secret = EphemeralSecret::new(OsRng);
-        let ephemeral_pub = PublicKey::from(&ephemeral_secret);
-        let ephemeral_pub_bytes = ephemeral_pub.as_bytes().to_vec();
-
-        // Perform X25519 key agreement
-        let shared_secret = ephemeral_secret.diffie_hellman(&recipient_pubkey);
-
-        // Derive AES key - consider using HKDF in production for better key derivation
-        let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
-        let cipher = Aes256Gcm::new(aes_key);
-
-        // Generate random nonce (12 bytes for AES-GCM)
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
-        let nonce = Nonce::from_slice(&nonce);
-
-        // Encrypt the secret
-        let encrypted = cipher.encrypt(nonce, secret).unwrap();
-
-        // Store all necessary components for decryption
-        encrypted_keys.push(RecipientEncryptedKey {
-            pubkey: pubkey_bytes,
-            ephemeral_pubkey: ephemeral_pub_bytes,
-            encrypted_key: encrypted,
-            nonce: nonce.to_vec(),
+    let mut recipient_keys: Vec<RecipientEncryptedKey> = Vec::with_capacity(recipients.len());
+    for recipient in recipients.into_iter() {
+        let protocol_impl = get_protocol_impl(recipient.protocol);
+        let wrapped: EncryptedData = protocol_impl.encrypt_key(&recipient.pubkey, None, key.as_slice())?;
+        recipient_keys.push(RecipientEncryptedKey {
+            pubkey: recipient.pubkey,
+            encrypted_key: wrapped,
+            protocol: recipient.protocol,
         });
     }
 
-    Ok(encrypted_keys)
+    Ok(EncryptResult {
+        ciphertext,
+        nonce: nonce_bytes.to_vec(),
+        recipient_keys,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex;
+    use dotenv::dotenv;
+    use std::env;
+    use starknet_types_core::felt::Felt;
+    use crate::decrypt::decrypt_shared_secret;
 
-    // #[test]
-    // fn test_generate_aes_key() {
-    //     let key = generate_aes_key();
-    //     // Convert the key to a hex string for easy viewing
-    //     let hex_key = hex::encode(key);
-    //     println!("Generated AES key: {}", hex_key);
-    //     // Optionally, assert the length is 32 bytes
-    //     assert_eq!(key.len(), 32);
-    // }
+    #[test]
+    fn test_generate_aes_key_len() {
+        let key = generate_aes_key();
+        assert_eq!(key.len(), 32);
+    }
+
+    fn load_env_keys() -> (Vec<u8>, Vec<u8>) {
+        dotenv().ok();
+        let privkey_felt = env
+            ::var("TEST_PRIVKEY")
+            .expect("TEST_PRIVKEY must be set")
+            .parse::<Felt>()
+            .expect("Invalid private key format");
+        let pubkey_felt = env
+            ::var("TEST_PUBKEY")
+            .expect("TEST_PUBKEY must be set")
+            .parse::<Felt>()
+            .expect("Invalid public key format");
+        (privkey_felt.to_bytes_be().to_vec(), pubkey_felt.to_bytes_be().to_vec())
+    }
+
+    #[test]
+    fn test_encrypt_message_and_decrypt_key_starknet() {
+        let (privkey_bytes, pubkey_bytes) = load_env_keys();
+        let message = b"hello starknet recipients".to_vec();
+
+        let recipients = vec![RecipientInfo { pubkey: pubkey_bytes.clone(), protocol: Protocol::Starknet }];
+        let result = encrypt_message(&message, recipients).expect("encrypt ok");
+
+        assert_eq!(result.recipient_keys.len(), 1);
+        let enc_key = &result.recipient_keys[0];
+
+        let decrypted_key = decrypt_shared_secret(&privkey_bytes, enc_key).expect("unwrap ok");
+        assert_eq!(decrypted_key.len(), 32);
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&decrypted_key));
+        let nonce = Nonce::from_slice(&result.nonce);
+        let plaintext = cipher.decrypt(nonce, result.ciphertext.as_ref()).expect("decrypt msg ok");
+        assert_eq!(plaintext, message);
+    }
 }

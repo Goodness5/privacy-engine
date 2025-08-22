@@ -2,9 +2,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
     Aes256Gcm, Key, Nonce,
 };
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey, x25519, X25519_BASEPOINT_BYTES};
 
-use crate::{traits::crypto::CryptoProtocol, types::WrappedKey};
+use crate::traits::crypto::CryptoProtocol;
 use crate::types::{CryptoError, EncryptedData};
 
 pub struct X25519Protocol;
@@ -15,12 +15,13 @@ impl X25519Protocol {
     }
 
     pub fn generate_ephemeral_keypair(&self) -> Result<(EphemeralSecret, Vec<u8>), CryptoError> {
-        let secret = EphemeralSecret::new(OsRng);
+        let mut rng = OsRng;
+        let secret = EphemeralSecret::random_from_rng(&mut rng);
         let pubkey = PublicKey::from(&secret).as_bytes().to_vec();
         Ok((secret, pubkey))
     }
 
-    pub fn derive_shared_secret(&self, secret: &EphemeralSecret, pubkey: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn derive_shared_secret(&self, secret: EphemeralSecret, pubkey: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let recipient_pubkey = PublicKey::from(
             <[u8; 32]>::try_from(pubkey).map_err(|_| CryptoError::PointError)?,
         );
@@ -28,16 +29,17 @@ impl X25519Protocol {
         Ok(shared_secret.as_bytes().to_vec())
     }
     fn generate_keypair(&self) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-        let secret = StaticSecret::new(OsRng);
-        let pubkey = PublicKey::from(&secret).as_bytes().to_vec();
-        Ok((secret.to_bytes().to_vec(), pubkey))
+        let mut privkey = [0u8; 32];
+        OsRng.fill_bytes(&mut privkey);
+        let pubkey = x25519(privkey, X25519_BASEPOINT_BYTES);
+        Ok((privkey.to_vec(), pubkey.to_vec()))
     }
 }
 
 impl CryptoProtocol for X25519Protocol {
-    fn encrypt_key(&self, key: &[u8], _msg_hash: Option<&[u8]>, pubkey: &str) -> Result<WrappedKey, CryptoError> {
+    fn encrypt_key(&self, recipient_identifier: &[u8], _msg_hash: Option<&[u8]>, key: &[u8]) -> Result<EncryptedData, CryptoError> {
         let (eph_secret, ephemeral_pubkey) = self.generate_ephemeral_keypair()?;
-        let aes_key_bytes = self.derive_shared_secret(&eph_secret, pubkey)?;
+        let aes_key_bytes = self.derive_shared_secret(eph_secret, recipient_identifier)?;
         let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
         let cipher = Aes256Gcm::new(aes_key);
         let mut nonce_bytes = [0u8; 12];
@@ -54,13 +56,14 @@ impl CryptoProtocol for X25519Protocol {
     }
 
     fn decrypt_key(&self, encrypted_data: &EncryptedData, privkey: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let privkey_scalar = <[u8; 32]>::try_from(privkey).map_err(|_| CryptoError::PointError)?;
-        let ephemeral_pubkey = PublicKey::from(
-            <[u8; 32]>::try_from(&encrypted_data.ephemeral_pubkey[..])
-                .map_err(|_| CryptoError::PointError)?,
-        );
-        let shared_secret = StaticSecret::from(privkey_scalar).diffie_hellman(&ephemeral_pubkey);
-        let aes_key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+        let privkey_scalar: [u8; 32] = privkey.try_into().map_err(|_| CryptoError::PointError)?;
+        let eph_pubkey_bytes: [u8; 32] = encrypted_data
+            .ephemeral_pubkey
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::PointError)?;
+        let shared_secret = x25519(privkey_scalar, eph_pubkey_bytes);
+        let aes_key = Key::<Aes256Gcm>::from_slice(&shared_secret);
         let cipher = Aes256Gcm::new(aes_key);
         let nonce = Nonce::from_slice(&encrypted_data.nonce);
         cipher
@@ -82,7 +85,6 @@ impl CryptoProtocol for X25519Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::CryptoError;
 
     #[test]
     fn test_generate_keypair() {
@@ -97,8 +99,8 @@ mod tests {
         let protocol = X25519Protocol::new();
         let (privkey, pubkey) = protocol.generate_keypair().unwrap();
         let key = b"test_key_123456789012345678901234".to_vec();
-        let encrypted = protocol.encrypt_key(&key, &pubkey).unwrap();
+        let encrypted = protocol.encrypt_key(&pubkey, None, &key).unwrap();
         let decrypted = protocol.decrypt_key(&encrypted, &privkey).unwrap();
-        // assert_eq!(decrypted, key);
+        assert_eq!(decrypted, key);
     }
 }

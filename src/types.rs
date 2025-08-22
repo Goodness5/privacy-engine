@@ -66,7 +66,7 @@ pub struct RecipientEncryptedKey {
     pub protocol: Protocol,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     Starknet,
     X25519,

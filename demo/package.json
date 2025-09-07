@@ -1,0 +1,29 @@
+{
+  "name": "privacy-engine-demo",
+  "version": "0.1.0",
+  "description": "Privacy Engine WebAssembly Demo Application",
+  "main": "index.html",
+  "scripts": {
+    "dev": "python -m http.server 8000",
+    "build": "cd .. && ./build-wasm.sh",
+    "serve": "python -m http.server 8000"
+  },
+  "keywords": [
+    "privacy",
+    "encryption",
+    "cryptography",
+    "wasm",
+    "webassembly",
+    "starknet",
+    "x25519"
+  ],
+  "author": "Privacy Engine Team",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "dependencies": {
+    "privacy-engine": "file:../wasm-client/pkg"
+  }
+}

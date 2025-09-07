@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 aes-gcm = "0.10.3"
@@ -21,12 +21,16 @@ starknet-core = "0.15.0"
 stark-curve = "0.1.3"
 sha2 = "0.10.9"
 generic-array = "1.2.0"
-dotenv = "0.15.0"
 
 # WebAssembly dependencies
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = [
+web-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
   "console",
   "Crypto",
   "SubtleCrypto",
@@ -39,8 +43,7 @@ web-sys = { version = "0.3", features = [
   "MessageEvent",
   "Worker",
   "DedicatedWorkerGlobalScope",
-] }
-console_error_panic_hook = "0.1"
+]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
@@ -48,4 +51,3 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.2"
-

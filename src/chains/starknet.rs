@@ -1,5 +1,5 @@
 use starknet_core::crypto::{ ecdsa_sign, ecdsa_verify, Signature };
-use starknet_crypto::{recover, ExtendedSignature, FieldElement as CryptoFieldElement};
+use starknet_crypto::{ recover, ExtendedSignature, FieldElement as CryptoFieldElement };
 use starknet_types_core::felt::Felt;
 use crate::traits::crypto::CryptoProtocol;
 use crate::types::{ CryptoError, EncryptedData };
@@ -19,8 +19,210 @@ use stark_curve::ff::PrimeField;
 use stark_curve::primeorder::Field;
 use stark_curve::elliptic_curve::sec1::ToEncodedPoint;
 
-
 impl StarknetProtocol {
+    /// Parse signature from recipient identifier bytes
+    fn parse_signature_from_identifier(
+        recipient_identifier: &[u8]
+    ) -> Result<ExtendedSignature, CryptoError> {
+        if recipient_identifier.len() != 96 {
+            // r(32) + s(32) + v(32)
+            return Err(CryptoError::SignError);
+        }
+
+        let r_bytes: [u8; 32] = recipient_identifier[..32]
+            .try_into()
+            .map_err(|_| CryptoError::SignError)?;
+        let s_bytes: [u8; 32] = recipient_identifier[32..64]
+            .try_into()
+            .map_err(|_| CryptoError::SignError)?;
+        let v_bytes: [u8; 32] = recipient_identifier[64..]
+            .try_into()
+            .map_err(|_| CryptoError::SignError)?;
+
+        Ok(ExtendedSignature {
+            r: CryptoFieldElement::from_bytes_be(&r_bytes).map_err(|_| CryptoError::SignError)?,
+            s: CryptoFieldElement::from_bytes_be(&s_bytes).map_err(|_| CryptoError::SignError)?,
+            v: CryptoFieldElement::from_bytes_be(&v_bytes).map_err(|_| CryptoError::SignError)?,
+        })
+    }
+
+    /// Recover public key from signature and message hash
+    fn recover_pubkey_from_signature(
+        recipient_identifier: &[u8],
+        msg_hash: &[u8]
+    ) -> Result<Felt, CryptoError> {
+        let signature = Self::parse_signature_from_identifier(recipient_identifier)?;
+        let msg_hash_bytes: [u8; 32] = msg_hash.try_into().map_err(|_| CryptoError::SignError)?;
+        let msg_hash_felt = Felt::from_bytes_be(&msg_hash_bytes);
+        Self::recover_pubkey(&msg_hash_felt, &signature)
+    }
+
+    /// Parse public key from recipient identifier bytes
+    fn parse_pubkey_from_identifier(recipient_identifier: &[u8]) -> Result<Felt, CryptoError> {
+        let pubkey_bytes: [u8; 32] = recipient_identifier
+            .try_into()
+            .map_err(|_| CryptoError::SignError)?;
+        Ok(Felt::from_bytes_be(&pubkey_bytes))
+    }
+
+    /// Convert public key to curve point
+    fn pubkey_to_curve_point(
+        pubkey: &Felt,
+        signature: &ExtendedSignature
+    ) -> Result<AffinePoint, CryptoError> {
+        let x = CurveFieldElement::from_be_bytes_mod_order(&pubkey.to_bytes_be());
+        let y_is_odd = (signature.v.to_bytes_be()[31] & 1) == 1;
+        let y = Self::compute_y_from_x(x, y_is_odd)?;
+
+        let encoded = EncodedPoint::<StarkCurve>::from_affine_coordinates(
+            &x.to_repr(),
+            &y.to_repr(),
+            false
+        );
+        AffinePoint::from_encoded_point(&encoded).into_option().ok_or(CryptoError::PointError)
+    }
+
+    /// Generate ephemeral key pair and compute shared secret
+    fn generate_ephemeral_and_shared_secret(
+        recipient_affine: &AffinePoint
+    ) -> Result<(AffinePoint, AffinePoint), CryptoError> {
+        let mut rng = OsRng;
+        let mut random_bytes = [0u8; 32];
+        rng.fill_bytes(&mut random_bytes);
+        let eph_sk = Scalar::from_be_bytes_mod_order(&random_bytes);
+
+        let gen_affine = AffinePoint::GENERATOR;
+        let gen_proj: ProjectivePoint = gen_affine.into();
+        let eph_proj = gen_proj * eph_sk;
+        let eph_affine: AffinePoint = eph_proj.into();
+
+        // Shared secret = recipient_affine * eph_sk
+        let shared_proj = ProjectivePoint::from(*recipient_affine) * eph_sk;
+        let shared_affine: AffinePoint = shared_proj.into();
+
+        Ok((eph_affine, shared_affine))
+    }
+
+    /// Derive AES key from shared secret
+    fn derive_aes_key(shared_affine: &AffinePoint) -> Result<[u8; 32], CryptoError> {
+        let encoded_shared = shared_affine.to_encoded_point(false);
+        let shared_x = encoded_shared.x().ok_or(CryptoError::PointError)?;
+        let mut h = Sha256::new();
+        h.update(shared_x.as_slice());
+        let aes_key_bytes = h.finalize();
+        Ok(aes_key_bytes.into())
+    }
+
+    /// Encrypt data with AES-GCM and serialize ephemeral public key
+    fn encrypt_with_aes_and_serialize_ephemeral(
+        key: &[u8],
+        aes_key: &Key<Aes256Gcm>,
+        eph_affine: &AffinePoint
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), CryptoError> {
+        let mut rng = OsRng;
+        let cipher = Aes256Gcm::new(aes_key);
+        let mut nonce_bytes = [0u8; 12];
+        rng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, key).map_err(|_| CryptoError::SymmetricError)?;
+
+        // Serialize ephemeral public key (uncompressed: x || y)
+        let encoded_eph = eph_affine.to_encoded_point(false);
+        let eph_x = encoded_eph.x().ok_or(CryptoError::PointError)?;
+        let eph_y = encoded_eph.y().ok_or(CryptoError::PointError)?;
+        let mut eph_bytes = Vec::with_capacity(64);
+        eph_bytes.extend_from_slice(eph_x.as_slice());
+        eph_bytes.extend_from_slice(eph_y.as_slice());
+
+        Ok((ciphertext, nonce_bytes.to_vec(), eph_bytes))
+    }
+
+    fn encrypt_with_signature(
+        &self,
+        sig_bytes: &[u8], // r||s||v (96 bytes)
+        msg_hash: &[u8], // 32 bytes
+        key: &[u8]
+    ) -> Result<EncryptedData, CryptoError> {
+        // First perform standard ECDH to wrap the key → DEK1 blob
+        let pubkey = Self::recover_pubkey_from_signature(sig_bytes, msg_hash)?;
+        let signature = Self::parse_signature_from_identifier(sig_bytes)?;
+        let recipient_affine = Self::pubkey_to_curve_point(&pubkey, &signature)?;
+        let (eph_affine, shared_affine) = Self::generate_ephemeral_and_shared_secret(
+            &recipient_affine
+        )?;
+        let aes_key_bytes = Self::derive_aes_key(&shared_affine)?;
+        let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
+
+        let (inner_ct, inner_nonce, inner_eph_pub) = Self::encrypt_with_aes_and_serialize_ephemeral(
+            key,
+            &aes_key,
+            &eph_affine
+        )?;
+
+        // Serialize DEK1 = nonce || eph_pubkey || ciphertext
+        let mut dek1_blob = Vec::with_capacity(12 + inner_eph_pub.len() + inner_ct.len());
+        dek1_blob.extend_from_slice(&inner_nonce);
+        dek1_blob.extend_from_slice(&inner_eph_pub);
+        dek1_blob.extend_from_slice(&inner_ct);
+
+        // Now derive DEK2 from msg_hash + signature and wrap DEK1
+        let dek2 = Self::derive_dek2_from_sig(msg_hash, sig_bytes);
+        let outer = Self::wrap_with_dek2(&dek1_blob, &dek2)?;
+
+        if outer.len() < 12 {
+            return Err(CryptoError::SymmetricError);
+        }
+        let (outer_nonce, outer_ct) = outer.split_at(12);
+
+        Ok(EncryptedData {
+            ciphertext: outer_ct.to_vec(),
+            nonce: outer_nonce.to_vec(),
+            ephemeral_pubkey: Vec::new(),
+        })
+    }
+
+    /// Encrypt key using public key directly (for clients that can provide public keys)
+    fn encrypt_with_public_key(
+        &self,
+        public_key: &[u8],
+        key: &[u8]
+    ) -> Result<EncryptedData, CryptoError> {
+        // Parse public key from bytes
+        let pubkey = Self::parse_pubkey_from_identifier(public_key)?;
+
+        // Create a dummy signature for curve point conversion (v=0 for even y, v=1 for odd y)
+        let signature = ExtendedSignature {
+            r: CryptoFieldElement::ZERO,
+            s: CryptoFieldElement::ZERO,
+            v: CryptoFieldElement::ZERO, // Will be determined during curve point conversion
+        };
+
+        // Convert public key to curve point
+        let recipient_affine = Self::pubkey_to_curve_point(&pubkey, &signature)?;
+
+        // Generate ephemeral key pair and compute shared secret
+        let (eph_affine, shared_affine) = Self::generate_ephemeral_and_shared_secret(
+            &recipient_affine
+        )?;
+
+        // Derive AES key from shared secret
+        let aes_key_bytes = Self::derive_aes_key(&shared_affine)?;
+        let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
+
+        // Encrypt data and serialize ephemeral public key
+        let (ciphertext, nonce, ephemeral_pubkey) = Self::encrypt_with_aes_and_serialize_ephemeral(
+            key,
+            &aes_key,
+            &eph_affine
+        )?;
+
+        Ok(EncryptedData {
+            ciphertext,
+            nonce,
+            ephemeral_pubkey,
+        })
+    }
+
     /// Helper function to compute y-coordinate from x and parity bit
     fn compute_y_from_x(
         x: CurveFieldElement,
@@ -70,8 +272,131 @@ impl StarknetProtocol {
 
         Ok(Felt::from_bytes_be(&pubkey_fe.to_bytes_be()))
     }
-}
 
+    /// Derive DEK2 from (msg_hash + signature)
+    pub fn derive_dek2_from_sig(msg_hash: &[u8], sig: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(msg_hash);
+        hasher.update(sig);
+        let digest = hasher.finalize();
+        let mut dek2 = [0u8; 32];
+        dek2.copy_from_slice(&digest[..32]);
+        dek2
+    }
+
+    /// Wrap DEK1 (already encrypted with ECDH) again under DEK2
+    pub fn wrap_with_dek2(dek1_cipher: &[u8], dek2: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let cipher = Aes256Gcm::new_from_slice(dek2).map_err(|_| CryptoError::SymmetricError)?;
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let nonce_obj = Nonce::from_slice(&nonce);
+
+        let ct = cipher.encrypt(nonce_obj, dek1_cipher).map_err(|_| CryptoError::SymmetricError)?;
+
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Unwrap DEK1 by first deriving DEK2 from sig+msg, then decrypting
+    pub fn unwrap_with_dek2(
+        wrapped: &[u8],
+        msg_hash: &[u8],
+        sig: &[u8]
+    ) -> Result<Vec<u8>, CryptoError> {
+        if wrapped.len() < 12 {
+            return Err(CryptoError::SymmetricError);
+        }
+        let dek2 = Self::derive_dek2_from_sig(msg_hash, sig);
+
+        let (nonce_bytes, ct) = wrapped.split_at(12);
+        let cipher = Aes256Gcm::new_from_slice(&dek2).map_err(|_| CryptoError::SymmetricError)?;
+        let nonce_obj = Nonce::from_slice(nonce_bytes);
+
+        cipher.decrypt(nonce_obj, ct).map_err(|_| CryptoError::SymmetricError)
+    }
+
+    /// Generate a fresh random challenge (32 bytes). Server should store and mark single-use.
+    pub fn generate_challenge(&self) -> Result<Vec<u8>, CryptoError> {
+        let mut rng = OsRng;
+        let mut challenge = vec![0u8; 32];
+        rng.fill_bytes(&mut challenge);
+        Ok(challenge)
+    }
+
+    /// Encrypt `key` with DEK2 derived from (challenge || signature).
+    /// - challenge: the fresh nonce server generated and sent to client
+    /// - signature_bytes: bytes returned by wallet signing challenge (e.g. r||s||v or r||s)
+    /// Returns EncryptedData with aes-gcm outer layer: { ciphertext, nonce, ephemeral_pubkey = [] }
+    pub fn encrypt_with_signature_challenge(
+        &self,
+        challenge: &[u8],
+        signature_bytes: &[u8],
+        key: &[u8]
+    ) -> Result<EncryptedData, CryptoError> {
+        if challenge.is_empty() || signature_bytes.is_empty() {
+            return Err(CryptoError::SignError);
+        }
+
+        // Derive DEK2 = SHA256(challenge || signature)
+        let mut h = Sha256::new();
+        h.update(challenge);
+        h.update(signature_bytes);
+        let dek2_bytes = h.finalize();
+
+        // AES-GCM encrypt `key` with dek2_bytes
+        let aes_key = Key::<Aes256Gcm>::from_slice(&dek2_bytes[..]);
+        let cipher = Aes256Gcm::new(aes_key);
+
+        let mut nonce_bytes = [0u8; 12];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher.encrypt(nonce, key).map_err(|_| CryptoError::SymmetricError)?;
+
+        Ok(EncryptedData {
+            ciphertext,
+            nonce: nonce_bytes.to_vec(),
+            ephemeral_pubkey: Vec::new(), // outer layer — no ephemeral pubkey
+        })
+    }
+
+    /// Decrypt the outer signature-derived layer.
+    /// - `wrapped` is the EncryptedData returned by encrypt_with_signature_challenge,
+    /// - `challenge` and `signature_bytes` must be identical to those used during encryption.
+    /// Returns the plaintext `key` on success.
+    pub fn decrypt_with_signature_challenge(
+        &self,
+        wrapped: &EncryptedData,
+        challenge: &[u8],
+        signature_bytes: &[u8]
+    ) -> Result<Vec<u8>, CryptoError> {
+        if wrapped.nonce.len() != 12 {
+            return Err(CryptoError::PointError);
+        }
+        if challenge.is_empty() || signature_bytes.is_empty() {
+            return Err(CryptoError::SignError);
+        }
+
+        // Derive DEK2 = SHA256(challenge || signature)
+        let mut h = Sha256::new();
+        h.update(challenge);
+        h.update(signature_bytes);
+        let dek2_bytes = h.finalize();
+
+        let aes_key = Key::<Aes256Gcm>::from_slice(&dek2_bytes[..]);
+        let cipher = Aes256Gcm::new(aes_key);
+        let nonce = Nonce::from_slice(&wrapped.nonce);
+
+        let plaintext = cipher
+            .decrypt(nonce, wrapped.ciphertext.as_ref())
+            .map_err(|_| CryptoError::SymmetricError)?;
+
+        Ok(plaintext)
+    }
+}
 
 impl CryptoProtocol for StarknetProtocol {
     fn verify_signature(
@@ -103,7 +428,7 @@ impl CryptoProtocol for StarknetProtocol {
         Ok(ecdsa_verify(&pubkey_felt, &msg_hash_felt, &signature).unwrap_or(false))
     }
 
-fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let privkey_bytes: [u8; 32] = privkey.try_into().map_err(|_| CryptoError::SignError)?;
         let privkey_felt = Felt::from_bytes_be(&privkey_bytes);
 
@@ -123,16 +448,22 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
         let pub_x = pub_encoded.x().ok_or(CryptoError::PointError)?;
 
         // Convert GenericArray to [u8; 32]
-        let pub_x_bytes: [u8; 32] = pub_x.as_slice().try_into().map_err(|_| CryptoError::SignError)?;
+        let pub_x_bytes: [u8; 32] = pub_x
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::SignError)?;
         let pubkey_felt = Felt::from_bytes_be(&pub_x_bytes);
 
         // Compute possible public keys from signature
-        let r_fe = CryptoFieldElement::from_bytes_be(&signature.r.to_bytes_be())
-            .map_err(|_| CryptoError::SignError)?;
-        let s_fe = CryptoFieldElement::from_bytes_be(&signature.s.to_bytes_be())
-            .map_err(|_| CryptoError::SignError)?;
-        let msg_fe = CryptoFieldElement::from_bytes_be(&msg_hash_felt.to_bytes_be())
-            .map_err(|_| CryptoError::SignError)?;
+        let r_fe = CryptoFieldElement::from_bytes_be(&signature.r.to_bytes_be()).map_err(
+            |_| CryptoError::SignError
+        )?;
+        let s_fe = CryptoFieldElement::from_bytes_be(&signature.s.to_bytes_be()).map_err(
+            |_| CryptoError::SignError
+        )?;
+        let msg_fe = CryptoFieldElement::from_bytes_be(&msg_hash_felt.to_bytes_be()).map_err(
+            |_| CryptoError::SignError
+        )?;
 
         // Try recovery IDs (0 or 1)
         let mut v_value = None;
@@ -158,120 +489,27 @@ fn sign_message(&self, privkey: &[u8], msg_hash: &[u8]) -> Result<Vec<u8>, Crypt
 
         Ok(sig_bytes)
     }
-    
+
     fn encrypt_key(
         &self,
         recipient_identifier: &[u8],
         msg_hash: Option<&[u8]>,
         key: &[u8]
     ) -> Result<EncryptedData, CryptoError> {
-
-        let mut signature = ExtendedSignature {
-            r: CryptoFieldElement::ZERO,
-            s: CryptoFieldElement::ZERO,
-            v: CryptoFieldElement::ZERO,
-        };
-        let pubkey = if let Some(hash) = msg_hash {
-            // We were given a signature and message hash
-            if recipient_identifier.len() != 96 {
-                // r(32) + s(32) + v(32)
-                return Err(CryptoError::SignError);
+        match msg_hash {
+            Some(hash) => {
+                // We were given a signature and message hash - use signature-based encryption
+                self.encrypt_with_signature(recipient_identifier, hash, key)
             }
-
-            let r_bytes: [u8; 32] = recipient_identifier[..32]
-                .try_into()
-                .map_err(|_| CryptoError::SignError)?;
-            let s_bytes: [u8; 32] = recipient_identifier[32..64]
-                .try_into()
-                .map_err(|_| CryptoError::SignError)?;
-            let v_bytes: [u8; 32] = recipient_identifier[64..]
-                .try_into()
-                .map_err(|_| CryptoError::SignError)?;
-
-            signature = ExtendedSignature {
-                r: CryptoFieldElement::from_bytes_be(&r_bytes).map_err(|_| CryptoError::SignError)?,
-                s: CryptoFieldElement::from_bytes_be(&s_bytes).map_err(|_| CryptoError::SignError)?,
-                v: CryptoFieldElement::from_bytes_be(&v_bytes).map_err(|_| CryptoError::SignError)?,
-            };
-
-            let msg_hash_bytes: [u8; 32] = hash.try_into().map_err(|_| CryptoError::SignError)?;
-            let msg_hash_felt = Felt::from_bytes_be(&msg_hash_bytes);
-
-            Self::recover_pubkey(&msg_hash_felt, &signature)?
-        } else {
-            // We were given a public key directly
-            let pubkey_bytes: [u8; 32] = recipient_identifier
-                .try_into()
-                .map_err(|_| CryptoError::SignError)?;
-            Felt::from_bytes_be(&pubkey_bytes)
-        };
-
-        // Convert recovered public key to curve point
-        let x = CurveFieldElement::from_be_bytes_mod_order(&pubkey.to_bytes_be());
-
-        // Try both possible y values
-        let y_is_odd = (signature.v.to_bytes_be()[31] & 1) == 1;
-        let y = Self::compute_y_from_x(x, y_is_odd)?;
-
-        let encoded = EncodedPoint::<StarkCurve>::from_affine_coordinates(
-            &x.to_repr(),
-            &y.to_repr(),
-            false
-        );
-        let recipient_affine = AffinePoint::from_encoded_point(&encoded)
-            .into_option()
-            .ok_or(CryptoError::PointError)?;
-
-        // Generate ephemeral scalar and public key
-        let mut rng = OsRng;
-        // Generate random scalar manually
-        let mut random_bytes = [0u8; 32];
-        rng.fill_bytes(&mut random_bytes);
-        let eph_sk = Scalar::from_be_bytes_mod_order(&random_bytes);
-
-        let gen_affine = AffinePoint::GENERATOR;
-        let gen_proj: ProjectivePoint = gen_affine.into();
-        let eph_proj = gen_proj * eph_sk;
-        let eph_affine: AffinePoint = eph_proj.into();
-
-        // Shared secret = recipient_affine * eph_sk
-        let shared_proj = ProjectivePoint::from(recipient_affine) * eph_sk;
-        let shared_affine: AffinePoint = shared_proj.into();
-
-        // Derive AES key using SHA-256 of shared secret's x-coordinate
-        let encoded_shared = shared_affine.to_encoded_point(false);
-        let shared_x = encoded_shared.x().ok_or(CryptoError::PointError)?;
-        let mut h = Sha256::new();
-        h.update(shared_x.as_slice());
-        let aes_key_bytes = h.finalize();
-        let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
-
-        // AES-GCM encrypt the decryption_key
-        let cipher = Aes256Gcm::new(aes_key);
-        let mut nonce_bytes = [0u8; 12];
-        rng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(nonce, key)
-            .map_err(|_| CryptoError::SymmetricError)?;
-
-        // Serialize ephemeral public key (uncompressed: x || y)
-        let encoded_eph = eph_affine.to_encoded_point(false);
-        let eph_x = encoded_eph.x().ok_or(CryptoError::PointError)?;
-        let eph_y = encoded_eph.y().ok_or(CryptoError::PointError)?;
-        let mut eph_bytes = Vec::with_capacity(64);
-        eph_bytes.extend_from_slice(eph_x.as_slice());
-        eph_bytes.extend_from_slice(eph_y.as_slice());
-
-        Ok(EncryptedData {
-            ciphertext,
-            nonce: nonce_bytes.to_vec(),
-            ephemeral_pubkey: eph_bytes,
-        })
+            None => {
+                // We were given a public key directly - use public key encryption
+                self.encrypt_with_public_key(recipient_identifier, key)
+            }
+        }
     }
 
     /// Decrypt the wrapped key using the private key
-     fn decrypt_key(&self, wrapped: &EncryptedData, privkey: &[u8],) -> Result<Vec<u8>, CryptoError> {
+    fn decrypt_key(&self, wrapped: &EncryptedData, privkey: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if wrapped.ephemeral_pubkey.len() != 64 {
             return Err(CryptoError::PointError);
         }
@@ -342,41 +580,46 @@ mod tests {
     }
 
     #[test]
-fn test_sign_with_recovery() {
-    let (privkey, msg_hash, expected_pubkey) = load_test_env();
-    let protocol = StarknetProtocol;
+    fn test_sign_with_recovery() {
+        let (privkey, msg_hash, expected_pubkey) = load_test_env();
+        let protocol = StarknetProtocol;
 
-    let privkey_bytes = privkey.to_bytes_be();
-    let msg_hash_bytes = msg_hash.to_bytes_be();
+        let privkey_bytes = privkey.to_bytes_be();
+        let msg_hash_bytes = msg_hash.to_bytes_be();
 
-    // Sign message (now returns r|s|v)
-    let sig = protocol.sign_message(&privkey_bytes, &msg_hash_bytes).unwrap();
-    println!("Signature length: {}, content: {:?}", sig.len(), sig);
+        // Sign message (now returns r|s|v)
+        let sig = protocol.sign_message(&privkey_bytes, &msg_hash_bytes).unwrap();
+        println!("Signature length: {}, content: {:?}", sig.len(), sig);
 
-    // Verify signature
-    let expected_pubkey_felt = expected_pubkey.parse::<Felt>().unwrap();
-    let pubkey_bytes = expected_pubkey_felt.to_bytes_be();
-    println!("Expected pubkey: {:?}", pubkey_bytes);
-    println!("Message hash: {:?}", msg_hash_bytes);
+        // Verify signature
+        let expected_pubkey_felt = expected_pubkey.parse::<Felt>().unwrap();
+        let pubkey_bytes = expected_pubkey_felt.to_bytes_be();
+        println!("Expected pubkey: {:?}", pubkey_bytes);
+        println!("Message hash: {:?}", msg_hash_bytes);
 
-    let verified = protocol.verify_signature(&pubkey_bytes, &msg_hash_bytes, &sig[..64]).unwrap();
-    assert!(verified, "Signature verification failed");
+        let verified = protocol
+            .verify_signature(&pubkey_bytes, &msg_hash_bytes, &sig[..64])
+            .unwrap();
+        assert!(verified, "Signature verification failed");
 
-    // Test key encryption/decryption
-    let secret_key = env::var("TEST_SECRET_KEY").unwrap_or_else(|_| "my_secret_key".to_string());
+        // Test key encryption/decryption
+        let secret_key = env
+            ::var("TEST_SECRET_KEY")
+            .unwrap_or_else(|_| "my_secret_key".to_string());
 
-    let wrapped_key = protocol.encrypt_key(&sig, Some(&msg_hash_bytes), secret_key.as_bytes()).unwrap();
-    println!("Wrapped Key: {:?}", wrapped_key);
+        let wrapped_key = protocol
+            .encrypt_key(&sig, Some(&msg_hash_bytes), secret_key.as_bytes())
+            .unwrap();
+        println!("Wrapped Key: {:?}", wrapped_key);
 
-    let encrypted_data = EncryptedData {
-        ciphertext: wrapped_key.ciphertext,
-        nonce: wrapped_key.nonce,
-        ephemeral_pubkey: wrapped_key.ephemeral_pubkey,
-    };
+        let encrypted_data = EncryptedData {
+            ciphertext: wrapped_key.ciphertext,
+            nonce: wrapped_key.nonce,
+            ephemeral_pubkey: wrapped_key.ephemeral_pubkey,
+        };
 
-    let decrypted_key = protocol.decrypt_key(&encrypted_data, &privkey_bytes).unwrap();
-    println!("Decrypted Key: {:?}", decrypted_key);
-    assert_eq!(decrypted_key, secret_key.as_bytes());
-}
-
+        let decrypted_key = protocol.decrypt_key(&encrypted_data, &privkey_bytes).unwrap();
+        println!("Decrypted Key: {:?}", decrypted_key);
+        assert_eq!(decrypted_key, secret_key.as_bytes());
+    }
 }

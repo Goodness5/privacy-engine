@@ -396,6 +396,70 @@ impl StarknetProtocol {
 
         Ok(plaintext)
     }
+
+
+     pub fn decrypt_key_with_signature(
+        &self,
+        wrapped: &EncryptedData,
+        privkey: &[u8],
+        signature: &[u8],
+        msg_hash: &[u8]
+    ) -> Result<Vec<u8>, CryptoError> {
+        // First, unwrap the outer layer using DEK2 derived from signature and message hash
+        // Reconstruct the full wrapped data: nonce || ciphertext
+        let mut full_wrapped = Vec::with_capacity(wrapped.nonce.len() + wrapped.ciphertext.len());
+        full_wrapped.extend_from_slice(&wrapped.nonce);
+        full_wrapped.extend_from_slice(&wrapped.ciphertext);
+        let dek1_blob = Self::unwrap_with_dek2(&full_wrapped, msg_hash, signature)?;
+        
+        // Extract components from DEK1 blob: nonce || eph_pubkey || ciphertext
+        if dek1_blob.len() < 12 {
+            return Err(CryptoError::SymmetricError);
+        }
+        let (inner_nonce, rest) = dek1_blob.split_at(12);
+        
+        if rest.len() < 64 {
+            return Err(CryptoError::SymmetricError);
+        }
+        let (inner_eph_pub, inner_ciphertext) = rest.split_at(64);
+        
+        // Parse ephemeral pubkey from DEK1
+        let eph_x = CurveFieldElement::from_be_bytes_mod_order(&inner_eph_pub[0..32]);
+        let eph_y = CurveFieldElement::from_be_bytes_mod_order(&inner_eph_pub[32..64]);
+
+        let encoded = EncodedPoint::<StarkCurve>::from_affine_coordinates(
+            &eph_x.to_repr(),
+            &eph_y.to_repr(),
+            false
+        );
+        let eph_affine = AffinePoint::from_encoded_point(&encoded)
+            .into_option()
+            .ok_or(CryptoError::PointError)?;
+
+        // Convert privkey to Scalar
+        let priv_scalar = Scalar::from_be_bytes_mod_order(privkey);
+
+        // Shared secret = eph_affine * priv_scalar
+        let shared_proj = ProjectivePoint::from(eph_affine) * priv_scalar;
+        let shared_affine: AffinePoint = shared_proj.into();
+
+        // Derive AES key
+        let encoded_shared = shared_affine.to_encoded_point(false);
+        let shared_x = encoded_shared.x().ok_or(CryptoError::PointError)?;
+        let mut h = Sha256::new();
+        h.update(shared_x.as_slice());
+        let aes_key_bytes = h.finalize();
+        let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes);
+
+        // Decrypt the inner ciphertext
+        let cipher = Aes256Gcm::new(aes_key);
+        let nonce = Nonce::from_slice(inner_nonce);
+        let plaintext = cipher
+            .decrypt(nonce, inner_ciphertext)
+            .map_err(|_| CryptoError::SymmetricError)?;
+
+        Ok(plaintext)
+    }
 }
 
 impl CryptoProtocol for StarknetProtocol {
@@ -510,6 +574,14 @@ impl CryptoProtocol for StarknetProtocol {
 
     /// Decrypt the wrapped key using the private key
     fn decrypt_key(&self, wrapped: &EncryptedData, privkey: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        // Check if this is signature-based encryption (empty ephemeral_pubkey)
+        if wrapped.ephemeral_pubkey.is_empty() {
+            // This is signature-based encryption - we need the signature and message hash
+            // For now, we'll return an error indicating this method doesn't support signature-based decryption
+            // The caller should use a different method that provides the signature and message hash
+            return Err(CryptoError::PointError);
+        }
+
         if wrapped.ephemeral_pubkey.len() != 64 {
             return Err(CryptoError::PointError);
         }
@@ -552,6 +624,7 @@ impl CryptoProtocol for StarknetProtocol {
         Ok(plaintext)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -610,7 +683,38 @@ mod tests {
         let wrapped_key = protocol
             .encrypt_key(&sig, Some(&msg_hash_bytes), secret_key.as_bytes())
             .unwrap();
-        println!("Wrapped Key: {:?}", wrapped_key);
+        println!("Wrapped Key (signature): {:?}", wrapped_key);
+
+        let encrypted_data = EncryptedData {
+            ciphertext: wrapped_key.ciphertext,
+            nonce: wrapped_key.nonce,
+            ephemeral_pubkey: wrapped_key.ephemeral_pubkey,
+        };
+
+        let decrypted_key = protocol.decrypt_key_with_signature(&encrypted_data, &privkey_bytes, &sig, &msg_hash_bytes).unwrap();
+        println!("Decrypted Key: {:?}", decrypted_key);
+        assert_eq!(decrypted_key, secret_key.as_bytes());
+    }
+
+    #[test]
+    fn test_public_key_encryption() {
+        let (privkey, _msg_hash, expected_pubkey) = load_test_env();
+        let protocol = StarknetProtocol;
+
+        let privkey_bytes = privkey.to_bytes_be();
+        let expected_pubkey_felt = expected_pubkey.parse::<Felt>().unwrap();
+        let pubkey_bytes = expected_pubkey_felt.to_bytes_be();
+
+        // Test key encryption/decryption using public key directly
+        let secret_key = env
+            ::var("TEST_SECRET_KEY")
+            .unwrap_or_else(|_| "my_secret_key".to_string());
+
+        // Encrypt using public key (no signature/message hash)
+        let wrapped_key = protocol
+            .encrypt_key(&pubkey_bytes, None, secret_key.as_bytes())
+            .unwrap();
+        println!("Wrapped Key (public key): {:?}", wrapped_key);
 
         let encrypted_data = EncryptedData {
             ciphertext: wrapped_key.ciphertext,
@@ -619,7 +723,7 @@ mod tests {
         };
 
         let decrypted_key = protocol.decrypt_key(&encrypted_data, &privkey_bytes).unwrap();
-        println!("Decrypted Key: {:?}", decrypted_key);
+        println!("Decrypted Key (public key): {:?}", decrypted_key);
         assert_eq!(decrypted_key, secret_key.as_bytes());
     }
 }
